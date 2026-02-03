@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "disinfo-lab"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "httpx",
+  "beautifulsoup4",
+  "sqlalchemy",
+  "streamlit",
+  "pandas"
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["disinfo_lab*"]
