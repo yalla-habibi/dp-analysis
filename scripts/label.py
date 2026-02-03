@@ -1,13 +1,14 @@
 import argparse
 import asyncio
 
+from disinfo_lab.storage import ensure_storage
 from disinfo_lab.pipeline import label_latest
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="label",
-        description="Etykietuje artykuły z DB przez Ollama.",
+        description="Etykietuje artykuły z DB przez Ollama (z mirrorem CSV).",
     )
     p.add_argument(
         "--task",
@@ -19,13 +20,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--batch",
         type=int,
         default=200,
-        help="Maksymalna liczba artykułów do rozważenia.",
+        help="Maksymalna liczba artykułów do rozważenia (najnowsze).",
     )
     p.add_argument(
         "--category-filter",
         type=str,
         default=None,
-        help="Opcjonalnie: etykietuj tylko Article.category == (np. 'opinia').",
+        help="Opcjonalnie: etykietuj tylko Article.category == (np. '9' lub 'opinia').",
     )
     return p
 
@@ -33,6 +34,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     batch = max(1, args.batch)
+
+    # zapewnij storage: sqlite jeśli jest, albo odtwórz z CSV, albo stwórz sqlite
+    ensure_storage()
 
     added, skipped, failed = asyncio.run(
         label_latest(task=args.task, batch_limit=batch, category_filter=args.category_filter)

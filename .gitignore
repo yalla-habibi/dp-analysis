@@ -17,6 +17,7 @@ venv/
 
 # databases / artifacts
 *.sqlite3
+*data/.sqlite3
 *.db
 
 # streamlit
