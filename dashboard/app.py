@@ -46,19 +46,62 @@ elif mode == "csv":
         df = pd.DataFrame()
     else:
         a = pd.read_csv(articles_csv)
+
         l = pd.read_csv(labels_csv) if labels_csv.exists() else pd.DataFrame()
 
-        if not l.empty:
-            df = a.merge(l, how="left", left_on="id", right_on="article_id", suffixes=("", "_label"))
-            df = df.rename(columns={"id": "article_id", "json": "label_json"})
-        else:
-            df = a.rename(columns={"id": "article_id"})
-            df["task"] = None
-            df["model"] = None
-            df["labeled_at"] = None
-            df["label_json"] = None
+        # Ujednolić identyfikator artykułu w articles.csv
+        # (czasem może już istnieć article_id, ale standardowo jest id)
+        if "article_id" not in a.columns and "id" in a.columns:
+            a = a.rename(columns={"id": "article_id"})
 
-        df = df.sort_values("article_id", ascending=False).head(500)
+        # W labels.csv oczekujemy article_id; jeśli ktoś miał id -> popraw
+        if not l.empty and "article_id" not in l.columns and "id" in l.columns:
+            l = l.rename(columns={"id": "article_id"})
+
+        # Ujednolić JSON etykiety
+        if not l.empty and "label_json" not in l.columns and "json" in l.columns:
+            l = l.rename(columns={"json": "label_json"})
+
+        # Jeżeli nie ma labeli, przygotuj puste kolumny
+        if l.empty:
+            df = a.copy()
+            for col in ["task", "model", "labeled_at", "label_json"]:
+                if col not in df.columns:
+                    df[col] = None
+        else:
+            # MERGE po article_id; po merge nie chcemy duplikatów
+            # Uwaga: labels mogą mieć wiele rekordów na artykuł (różne task/model)
+            # W dashboardzie weźmiemy najnowszy label per article_id (po created_at jeśli jest).
+            l2 = l.copy()
+
+            if "created_at" in l2.columns:
+                l2 = l2.sort_values("created_at", ascending=False)
+                l2 = l2.drop_duplicates(subset=["article_id"], keep="first")
+            elif "id" in l2.columns:
+                l2 = l2.sort_values("id", ascending=False)
+                l2 = l2.drop_duplicates(subset=["article_id"], keep="first")
+            else:
+                l2 = l2.drop_duplicates(subset=["article_id"], keep="first")
+
+            df = a.merge(l2, how="left", on="article_id", suffixes=("", "_label"))
+
+            # Jeśli po merge pojawiły się przypadkiem duplikaty nazw, zbij je
+            # (pandas na ogół suffixuje, ale lepiej być odpornym)
+            df = df.loc[:, ~df.columns.duplicated()]
+
+            # Ujednolić nazwę czasu etykiety
+            if "labeled_at" not in df.columns and "created_at_label" in df.columns:
+                df = df.rename(columns={"created_at_label": "labeled_at"})
+            elif "labeled_at" not in df.columns and "created_at" in l2.columns:
+                # jeżeli label.created_at weszło jako created_at (gdy articles nie miały created_at)
+                # zabezpieczenie:
+                pass
+
+        # final sort
+        if "article_id" in df.columns:
+            df = df.sort_values("article_id", ascending=False).head(500)
+        else:
+            df = df.head(500)
 
 else:
     # empty: wymuś utworzenie sqlite (przydatne w chmurze)
@@ -71,7 +114,7 @@ st.dataframe(df, use_container_width=True)
 
 st.subheader("Agregaty")
 col1, col2, col3 = st.columns(3)
-col1.metric("Articles", int(df["article_id"].nunique()) if not df.empty else 0)
+col1.metric("Articles", int(df["article_id"].nunique()) if (not df.empty and "article_id" in df.columns) else 0)
 col2.metric("Labels", int(df["label_json"].notna().sum()) if (not df.empty and "label_json" in df.columns) else 0)
 col3.metric("Categories", int(df["category"].dropna().nunique()) if (not df.empty and "category" in df.columns) else 0)
 
@@ -82,7 +125,7 @@ if not df.empty and "category" in df.columns:
     st.bar_chart(cat.set_index("category"))
 
 st.subheader("Podgląd etykiety JSON")
-if not df.empty:
+if not df.empty and "article_id" in df.columns:
     ids = df["article_id"].dropna().astype(int).tolist()
     pick = st.selectbox("Wybierz article_id", ids[:200] if ids else [])
     if pick:
