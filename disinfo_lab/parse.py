@@ -63,9 +63,20 @@ def parse_meta(html: str) -> Dict[str, Optional[str]]:
 
 
 def infer_category_from_url(url: str) -> Optional[str]:
+    """
+    Heuristic fallback category from URL path.
+
+    Important: many WP permalinks start with /YYYY/MM/,
+    which should NOT be treated as a category.
+    """
     try:
         p = urlparse(url)
         parts = [x for x in p.path.split("/") if x]
-        return parts[0] if parts else None
+        if not parts:
+            return None
+        # Ignore year-based permalinks like /2026/02/...
+        if parts[0].isdigit() and len(parts[0]) == 4:
+            return None
+        return parts[0]
     except Exception:
         return None
