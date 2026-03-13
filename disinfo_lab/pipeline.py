@@ -1,55 +1,236 @@
 from __future__ import annotations
 
+from datetime import datetime, UTC
+import html as html_mod
 import json
-from typing import Iterable, Optional, Tuple, List
+import re
+import sqlite3
+from typing import Iterable, Optional
 
 from disinfo_lab.config import cfg, assert_cfg
-from disinfo_lab.db import init_db, make_session, Article, LLMLabel
-from disinfo_lab.crawl import collect_all_urls, collect_wp_posts, WPPostRef
+from disinfo_lab.db import connect, init_db
+from disinfo_lab.crawl import collect_wp_posts, WPPostRef
 from disinfo_lab.parse import fetch_article_html, extract_clean_text, parse_meta, infer_category_from_url
-from disinfo_lab.llm_label import ollama_label
+from disinfo_lab.llm_label import STANCE_KEYS, ollama_label
 from disinfo_lab.storage import ensure_storage, export_sqlite_to_csv, sqlite_path_from_db_url
 
 assert_cfg(cfg)
 
-# Upewnij się, że DB istnieje (albo została odtworzona z CSV)
+# Make sure storage exists before any pipeline work starts.
 ensure_storage()
 
-Session = make_session(cfg.db_url)
-
-# Mapowanie ID kategorii WP -> nazwa kanoniczna w naszej bazie
 WP_CATEGORY_MAP = {
     9: "opinia",
 }
 
+AXIS_KEYWORDS = {
+    "UE": ["ue", "unia europejska", "unia", "bruksela", "komisja europejska", "parlament europejski"],
+    "NATO": ["nato", "sojusz", "pakt polnocnoatlantycki", "polnocnoatlantycki"],
+    "USA": ["usa", "stany zjednoczone", "ameryka", "waszyngton", "biden", "pentagon"],
+    "Ukraina": ["ukraina", "kijow", "zelenski", "donbas", "charkow", "odesa"],
+    "Rosja": ["rosja", "kreml", "moskwa", "putin", "federacja rosyjska", "rf"],
+    "Niemcy": ["niemcy", "berlin", "scholz", "bundestag"],
+    "Litwa": ["litwa", "wilno", "vilnius"],
+    "Bialorus": ["bialorus", "bialoruś", "minsk", "mińsk", "lukaszenka", "łukaszenka"],
+    "Rzad_Polski": ["rzad", "rząd", "premier", "minist", "koalicja", "sejm", "kancelaria premiera", "rząd rp", "rzad rp"],
+}
+
+
+def _utc_now_str() -> str:
+    return datetime.now(UTC).replace(tzinfo=None).isoformat(sep=" ")
+
 
 def _export_mirror_csv() -> None:
-    p = sqlite_path_from_db_url(cfg.db_url)
-    if p is not None and p.exists():
-        export_sqlite_to_csv(p)
+    path = sqlite_path_from_db_url(cfg.db_url)
+    if path is not None and path.exists():
+        export_sqlite_to_csv(path)
 
 
-def _category_from_wp_categories(cat_ids: List[int]) -> Optional[str]:
-    """
-    Translate WP category IDs into our canonical category string.
-    If multiple categories match, first match wins (order as returned by WP).
-    """
-    for cid in cat_ids:
-        if cid in WP_CATEGORY_MAP:
-            return WP_CATEGORY_MAP[cid]
+def _category_from_wp_categories(category_ids: list[int]) -> Optional[str]:
+    for category_id in category_ids:
+        if category_id in WP_CATEGORY_MAP:
+            return WP_CATEGORY_MAP[category_id]
     return None
 
 
-async def ingest_urls(urls: Iterable[str], forced_category: Optional[str] = None) -> Tuple[int, int, int]:
-    """
-    Generic ingest from URLs only (kept for backward compatibility).
-    """
+def _article_exists(con: sqlite3.Connection, url: str) -> bool:
+    row = con.execute("SELECT 1 FROM articles WHERE url = ? LIMIT 1", (url,)).fetchone()
+    return row is not None
+
+
+def _insert_article(
+    con: sqlite3.Connection,
+    *,
+    url: str,
+    title: Optional[str],
+    category: Optional[str],
+    published_at: Optional[str],
+    source_hint: Optional[str],
+    raw_html: str,
+    clean_text: str,
+) -> None:
+    con.execute(
+        """
+        INSERT INTO articles (
+            url, title, category, published_at, source_hint, raw_html, clean_text, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            url,
+            title,
+            category,
+            published_at,
+            source_hint,
+            raw_html,
+            clean_text,
+            _utc_now_str(),
+        ),
+    )
+
+
+def _shorten(text: str | None, limit: int = 90) -> str:
+    if not text:
+        return ""
+    text = text.strip().replace("\n", " ")
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+def sanitize_text(text: str) -> str:
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+
+    if "<" in cleaned and ">" in cleaned:
+        cleaned = re.sub(r"(?is)<script.*?>.*?</script>", " ", cleaned)
+        cleaned = re.sub(r"(?is)<style.*?>.*?</style>", " ", cleaned)
+        cleaned = re.sub(r"(?is)<noscript.*?>.*?</noscript>", " ", cleaned)
+        cleaned = re.sub(r"(?is)<[^>]+>", " ", cleaned)
+
+    cleaned = html_mod.unescape(cleaned)
+
+    junk_patterns = [
+        r"(?i)cookies?",
+        r"(?i)polityka prywatnosci",
+        r"(?i)polityka prywatności",
+        r"(?i)udostepnij|udostępnij|share|tweet|facebook|x\.com",
+        r"(?i)subskrybuj|newsletter",
+        r"(?i)zaloguj|logowanie|rejestracja",
+        r"(?i)komentarze?\b",
+    ]
+    for pattern in junk_patterns:
+        cleaned = re.sub(pattern, " ", cleaned)
+
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def detect_axes(text: str) -> list[str]:
+    lowered = (text or "").casefold()
+    found: list[str] = []
+    for axis, keywords in AXIS_KEYWORDS.items():
+        for keyword in keywords:
+            if keyword.casefold() in lowered:
+                found.append(axis)
+                break
+    return found
+
+
+def sentence_split(text: str) -> list[str]:
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    parts = re.split(r"(?<=[\.\!\?\…])\s+", text)
+    return [part.strip() for part in parts if len(part.strip()) >= 20]
+
+
+def axis_focused_excerpt(text: str, *, max_chars: int = 2600, max_sentences: int = 22) -> str:
+    cleaned = sanitize_text(text)
+    sentences = sentence_split(cleaned)
+    if not sentences:
+        return cleaned[:max_chars]
+
+    chosen: list[str] = []
+    for sentence in sentences[:3]:
+        chosen.append(sentence)
+
+    lowered_sentences = [(sentence, sentence.casefold()) for sentence in sentences]
+    for _, keywords in AXIS_KEYWORDS.items():
+        for sentence, lowered in lowered_sentences:
+            if any(keyword.casefold() in lowered for keyword in keywords):
+                if sentence not in chosen:
+                    chosen.append(sentence)
+                if len(chosen) >= max_sentences:
+                    break
+        if len(chosen) >= max_sentences:
+            break
+
+    for sentence in sentences[-2:]:
+        if sentence not in chosen:
+            chosen.append(sentence)
+
+    excerpt = "\n".join(chosen)
+    if len(excerpt) > max_chars:
+        excerpt = excerpt[:max_chars].rstrip()
+    return excerpt.strip()
+
+
+def make_llm_input(title: str | None, text: str) -> tuple[str, list[str]]:
+    cleaned = sanitize_text(text)
+    axes = detect_axes(cleaned)
+    excerpt = axis_focused_excerpt(cleaned)
+    axes_line = ", ".join(axes) if axes else "(brak)"
+
+    llm_input = (
+        f"TYTUL: {title or ''}\n"
+        f"WYKRYTE_OSIE: {axes_line}\n"
+        f"TEKST:\n{excerpt}\n"
+    )
+    return llm_input, axes
+
+
+def all_stance_zero(label: dict[str, object]) -> bool:
+    stance = label.get("stance") if isinstance(label, dict) else {}
+    if not isinstance(stance, dict):
+        return True
+
+    for key in STANCE_KEYS:
+        try:
+            if int(stance.get(key, 0)) != 0:
+                return False
+        except Exception:
+            continue
+    return True
+
+
+def log_saved(article: sqlite3.Row, label: dict[str, object]) -> None:
+    stance = label.get("stance") if isinstance(label, dict) else {}
+    techniques = label.get("techniques") if isinstance(label, dict) else []
+    confidence = label.get("confidence") if isinstance(label, dict) else None
+    evidence = label.get("evidence") if isinstance(label, dict) else []
+
+    compact_stance = {key: stance.get(key) for key in STANCE_KEYS} if isinstance(stance, dict) else {}
+    evidence_list = evidence if isinstance(evidence, list) else []
+
+    print(
+        "[saved] "
+        f"url={article['url']} | conf={confidence} | stance={compact_stance} | tech={techniques} | "
+        f"ev1={_shorten(evidence_list[0] if len(evidence_list) > 0 else '')!r} | "
+        f"ev2={_shorten(evidence_list[1] if len(evidence_list) > 1 else '')!r} | "
+        f"ev3={_shorten(evidence_list[2] if len(evidence_list) > 2 else '')!r} | "
+        f"title={_shorten(article['title'])!r}",
+        flush=True,
+    )
+
+
+async def ingest_urls(urls: Iterable[str], forced_category: Optional[str] = None) -> tuple[int, int, int]:
     init_db(cfg.db_url)
 
     added = skipped = failed = 0
-    with Session() as s:
+    with connect(cfg.db_url) as con:
         for url in urls:
-            if s.query(Article).filter_by(url=url).first():
+            if _article_exists(con, url):
                 skipped += 1
                 continue
 
@@ -59,54 +240,41 @@ async def ingest_urls(urls: Iterable[str], forced_category: Optional[str] = None
                 text = extract_clean_text(html)
                 category = forced_category or meta.get("category") or infer_category_from_url(url)
 
-                s.add(
-                    Article(
-                        url=url,
-                        title=meta.get("title"),
-                        category=category,
-                        published_at=meta.get("published_at"),
-                        source_hint=meta.get("source_hint"),
-                        raw_html=html,
-                        clean_text=text,
-                    )
+                _insert_article(
+                    con,
+                    url=url,
+                    title=meta.get("title"),
+                    category=category,
+                    published_at=meta.get("published_at"),
+                    source_hint=meta.get("source_hint"),
+                    raw_html=html,
+                    clean_text=text,
                 )
-                s.commit()
+                con.commit()
                 added += 1
             except Exception:
-                s.rollback()
+                con.rollback()
                 failed += 1
 
-    # mirror CSV po ingest
     _export_mirror_csv()
     return added, skipped, failed
 
 
-async def ingest_latest_wp(category_id: Optional[int], limit: int = 50) -> Tuple[int, int, int]:
-    """
-    Ingest latest WP posts, taking category from WP taxonomy (not from URL).
-
-    - If `category_id` is provided, we query WP for this category.
-    - The stored `Article.category` will be:
-        forced (if `category_id` maps in WP_CATEGORY_MAP) OR
-        derived from the post's `categories` list via WP_CATEGORY_MAP OR
-        fallback from HTML/meta/URL (last resort).
-    """
+async def ingest_latest_wp(category_id: Optional[int], limit: int = 50) -> tuple[int, int, int]:
     init_db(cfg.db_url)
 
-    posts: List[WPPostRef] = await collect_wp_posts(
+    posts: list[WPPostRef] = await collect_wp_posts(
         category_id=category_id,
         per_page=limit,
         pages=1,
     )
-
-    # Jeśli wołasz ingest z konkretnym category_id, możesz wymusić kanoniczną nazwę
     forced_category = WP_CATEGORY_MAP.get(category_id) if category_id is not None else None
 
     added = skipped = failed = 0
-    with Session() as s:
-        for p in posts:
-            url = p["link"]
-            if s.query(Article).filter_by(url=url).first():
+    with connect(cfg.db_url) as con:
+        for post in posts:
+            url = post["link"]
+            if _article_exists(con, url):
                 skipped += 1
                 continue
 
@@ -115,74 +283,116 @@ async def ingest_latest_wp(category_id: Optional[int], limit: int = 50) -> Tuple
                 meta = parse_meta(html)
                 text = extract_clean_text(html)
 
-                wp_cat = _category_from_wp_categories(p.get("categories", []))
-                category = forced_category or wp_cat or meta.get("category") or infer_category_from_url(url)
-
-                s.add(
-                    Article(
-                        url=url,
-                        title=meta.get("title"),
-                        category=category,
-                        published_at=meta.get("published_at"),
-                        source_hint=meta.get("source_hint"),
-                        raw_html=html,
-                        clean_text=text,
-                    )
+                category = (
+                    forced_category
+                    or _category_from_wp_categories(post.get("categories", []))
+                    or meta.get("category")
+                    or infer_category_from_url(url)
                 )
-                s.commit()
+
+                _insert_article(
+                    con,
+                    url=url,
+                    title=meta.get("title"),
+                    category=category,
+                    published_at=meta.get("published_at"),
+                    source_hint=meta.get("source_hint"),
+                    raw_html=html,
+                    clean_text=text,
+                )
+                con.commit()
                 added += 1
             except Exception:
-                s.rollback()
+                con.rollback()
                 failed += 1
 
     _export_mirror_csv()
     return added, skipped, failed
 
 
-async def label_latest(task: str, batch_limit: int = 200, category_filter: str | None = None) -> Tuple[int, int, int]:
+async def label_latest(
+    task: str,
+    batch_limit: int = 200,
+    category_filter: str | None = None,
+) -> tuple[int, int, int]:
     init_db(cfg.db_url)
 
-    added = skipped = failed = 0
-    with Session() as s:
-        q = s.query(Article)
-        if category_filter:
-            q = q.filter(Article.category == category_filter)
+    articles_query = """
+        SELECT id, url, title, category, clean_text
+        FROM articles
+        {where_clause}
+        ORDER BY id DESC
+        LIMIT ?
+    """
+    where_clause = "WHERE category = ?" if category_filter else ""
+    params: list[object] = [category_filter, batch_limit] if category_filter else [batch_limit]
 
-        arts = q.order_by(Article.id.desc()).limit(batch_limit).all()
+    added = skipped = failed = retried = 0
+    with connect(cfg.db_url) as con:
+        articles = con.execute(articles_query.format(where_clause=where_clause), params).fetchall()
 
-        for a in arts:
-            if not (a.clean_text or "").strip():
+        for index, article in enumerate(articles, start=1):
+            clean_text = (article["clean_text"] or "").strip()
+            if not clean_text:
                 skipped += 1
                 continue
 
-            exists = (
-                s.query(LLMLabel)
-                .filter_by(article_id=a.id, model=cfg.ollama_model, task=task)
-                .first()
-            )
+            exists = con.execute(
+                """
+                SELECT 1
+                FROM llm_labels
+                WHERE article_id = ? AND model = ? AND task = ?
+                LIMIT 1
+                """,
+                (article["id"], cfg.ollama_model, task),
+            ).fetchone()
             if exists:
                 skipped += 1
                 continue
 
             try:
-                payload = f"TITLE: {a.title or ''}\nURL: {a.url}\n\nTEXT:\n{a.clean_text}"
-                lbl = await ollama_label(payload)
+                llm_input, axes = make_llm_input(article["title"], clean_text)
+                print(f"[{index}/{len(articles)}] label -> {article['url']}", flush=True)
+                label = await ollama_label(llm_input)
 
-                s.add(
-                    LLMLabel(
-                        article_id=a.id,
-                        model=cfg.ollama_model,
-                        task=task,
-                        json=json.dumps(lbl, ensure_ascii=False),
+                if axes and all_stance_zero(label):
+                    retried += 1
+                    retry_input = (
+                        llm_input
+                        + "\nUWAGA: WYKRYTE_OSIE nie sa puste. Co najmniej jedna z nich musi miec stance != 0. "
+                          "Jesli sygnaly sa slabe, wybierz +/-1 i obniz confidence.\n"
                     )
-                )
-                s.commit()
-                added += 1
-            except Exception as e:
-                s.rollback()
-                failed += 1
-                print(f"[label_latest] FAILED article_id={a.id} err={type(e).__name__}: {e}")
+                    print(f"[{index}/{len(articles)}] retry(all-zero) -> {article['url']}", flush=True)
+                    label = await ollama_label(retry_input)
 
-    # mirror CSV po label
+                con.execute(
+                    """
+                    INSERT INTO llm_labels (article_id, model, task, json, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        article["id"],
+                        cfg.ollama_model,
+                        task,
+                        json.dumps(label, ensure_ascii=False),
+                        _utc_now_str(),
+                    ),
+                )
+                con.commit()
+                added += 1
+                log_saved(article, label)
+            except Exception as exc:
+                con.rollback()
+                failed += 1
+                print(
+                    f"[{index}/{len(articles)}] LABEL FAILED article_id={article['id']} "
+                    f"url={article['url']} err={type(exc).__name__}: {exc}",
+                    flush=True,
+                )
+
     _export_mirror_csv()
+    print(
+        f"Done. added={added} skipped={skipped} failed={failed} retried={retried}",
+        flush=True,
+    )
     return added, skipped, failed

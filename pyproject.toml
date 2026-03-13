@@ -9,7 +9,6 @@ requires-python = ">=3.10"
 dependencies = [
   "httpx",
   "beautifulsoup4",
-  "sqlalchemy",
   "streamlit",
   "pandas"
 ]

@@ -1,60 +1,67 @@
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Optional
-
-from sqlalchemy import (
-    String, Text, Integer, DateTime, ForeignKey, UniqueConstraint, create_engine
-)
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
+import sqlite3
+from pathlib import Path
+from typing import Any, Iterable, Optional
 
 
-class Base(DeclarativeBase):
-    pass
+def sqlite_path_from_db_url(db_url: str) -> Path:
+    if not db_url.startswith("sqlite:///"):
+        raise ValueError(f"Only sqlite DB URLs are supported, got: {db_url}")
+
+    raw_path = db_url.removeprefix("sqlite:///")
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    return path
 
 
-class Article(Base):
-    __tablename__ = "articles"
+def connect(db_url: str) -> sqlite3.Connection:
+    path = sqlite_path_from_db_url(db_url)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    url: Mapped[str] = mapped_column(String(1024), unique=True, index=True)
-
-    title: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
-    category: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
-    published_at: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
-    source_hint: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
-
-    raw_html: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    clean_text: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-    labels: Mapped[list["LLMLabel"]] = relationship(back_populates="article", cascade="all, delete-orphan")
-
-
-class LLMLabel(Base):
-    __tablename__ = "llm_labels"
-    __table_args__ = (
-        UniqueConstraint("article_id", "model", "task", name="uq_label_article_model_task"),
-    )
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    article_id: Mapped[int] = mapped_column(ForeignKey("articles.id"), index=True)
-
-    model: Mapped[str] = mapped_column(String(128))
-    task: Mapped[str] = mapped_column(String(128))
-
-    json: Mapped[str] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-
-    article: Mapped["Article"] = relationship(back_populates="labels")
-
-
-def make_session(db_url: str):
-    engine = create_engine(db_url, future=True)
-    return sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
+    con = sqlite3.connect(path.as_posix())
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA foreign_keys = ON")
+    return con
 
 
 def init_db(db_url: str) -> None:
-    engine = create_engine(db_url, future=True)
-    Base.metadata.create_all(engine)
+    with connect(db_url) as con:
+        con.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS articles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT NOT NULL UNIQUE,
+                title TEXT,
+                category TEXT,
+                published_at TEXT,
+                source_hint TEXT,
+                raw_html TEXT,
+                clean_text TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS llm_labels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                article_id INTEGER NOT NULL,
+                model TEXT NOT NULL,
+                task TEXT NOT NULL,
+                json TEXT NOT NULL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(article_id) REFERENCES articles(id) ON DELETE CASCADE,
+                UNIQUE(article_id, model, task)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_articles_url ON articles(url);
+            CREATE INDEX IF NOT EXISTS idx_llm_labels_article_id ON llm_labels(article_id);
+            """
+        )
+
+
+def fetch_all(con: sqlite3.Connection, query: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
+    return list(con.execute(query, tuple(params)).fetchall())
+
+
+def fetch_one(con: sqlite3.Connection, query: str, params: Iterable[Any] = ()) -> Optional[sqlite3.Row]:
+    return con.execute(query, tuple(params)).fetchone()

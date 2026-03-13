@@ -1,6 +1,9 @@
 import argparse
 import asyncio
+import sys
 
+from disinfo_lab.config import cfg
+from disinfo_lab.llm_label import ollama_is_available
 from disinfo_lab.storage import ensure_storage
 from disinfo_lab.pipeline import label_latest
 
@@ -37,6 +40,17 @@ def main() -> None:
 
     # zapewnij storage: sqlite jeśli jest, albo odtwórz z CSV, albo stwórz sqlite
     ensure_storage()
+
+    ok, error = asyncio.run(ollama_is_available())
+    if not ok:
+        print(
+            "Ollama is not reachable.\n"
+            f"Configured base URL: {cfg.ollama_base_url}\n"
+            f"Configured model: {cfg.ollama_model}\n"
+            f"Connection error: {error}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
     added, skipped, failed = asyncio.run(
         label_latest(task=args.task, batch_limit=batch, category_filter=args.category_filter)

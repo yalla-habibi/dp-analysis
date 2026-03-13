@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 
 import pandas as pd
 
-from disinfo_lab.db import init_db
+from disinfo_lab.db import init_db, sqlite_path_from_db_url
 from disinfo_lab.config import cfg, assert_cfg
 
 assert_cfg(cfg)
@@ -23,26 +23,11 @@ def _data_dir() -> Path:
     return d
 
 
-def sqlite_path_from_db_url(db_url: str) -> Optional[Path]:
-    """
-    Obsługuje wyłącznie sqlite:///relative/path lub sqlite:////abs/path.
-    """
-    if not db_url.startswith("sqlite:///"):
-        return None
-    path_part = db_url[len("sqlite:///") :]
-
-    # sqlite:////abs/path -> path_part startswith "/"
-    p = Path(path_part)
-    if not p.is_absolute():
-        # relative => relative to current working directory
-        p = (Path.cwd() / p).resolve()
-    return p
-
-
 def storage_paths() -> Tuple[Path, Path, Path]:
     d = _data_dir()
-    db_path = sqlite_path_from_db_url(cfg.db_url)
-    if db_path is None:
+    try:
+        db_path = sqlite_path_from_db_url(cfg.db_url)
+    except ValueError:
         # fallback: trzymamy db w data/ jeśli db_url nie wskazuje sqlite
         db_path = (d / "disinfo_lab.sqlite3").resolve()
     return db_path, (d / ARTICLES_CSV), (d / LABELS_CSV)
